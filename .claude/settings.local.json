@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/root/miniconda3/envs/omni/bin/python -c \"\nimport torch\n\n# 创建一个简单的测试来验证GPU是否真正在工作\ndevice = torch.device(''cuda:0'')\nx = torch.randn(1000, 1000).to(device)\ny = torch.randn(1000, 1000).to(device)\n\n# 执行计算\nimport time\nstart = time.time()\nfor i in range(100):\n    z = torch.mm(x, y)\ntorch.cuda.synchronize()\nprint(f''GPU计算时间: {time.time() - start:.3f}秒'')\n\n# CPU对比\nx_cpu = x.cpu()\ny_cpu = y.cpu()\nstart = time.time()\nfor i in range(100):\n    z_cpu = torch.mm(x_cpu, y_cpu)\nprint(f''CPU计算时间: {time.time() - start:.3f}秒'')\n\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
