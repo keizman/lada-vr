@@ -76,17 +76,19 @@ Running the pipeline (examples)
       --out-dir "K:\\tmp\\v\\code\\demosaic\\VR_out\\pilot_tiles" \
       --layout sbs --projection equirect360 --plane-mode persp_tiles \
       --tiles-x 4 --tiles-y 2 --fov 100 --save-every-n 10 --max-frames 600
-  - ROI mid-lower small views (recommended for testing without full coverage):
+  - ROI mid-lower small views (grid3x3 stitch; no spherical math):
     - python VR/cli/run_pipeline.py \
       --input "K:\\tmp\\v\\code\\demosaic\\8199881-4k-1m.mp4" \
-      --out-dir "K:\\tmp\\v\\code\\demosaic\\VR_out\\pilot_roi" \
-      --layout sbs --projection equirect360 --plane-mode roi_persp \
-      --fov 120 --save-every-n 10 --max-frames 600
+      --out-dir "K:\\tmp\\v\\code\\demosaic\\VR_out\\pilot_roi_grid" \
+      --layout sbs --projection equirect360 --plane-mode roi_grid3x3 \
+      --save-every-n 10 --max-frames 600
 
 Notes
 - Undistortion parameters (fisheye defaults):
   - fx=fy≈min(w,h)/π, cx=w/2, cy=h/2, k1=-0.25 (k2=k3=k4=0)
   - These are safe defaults for 180° fisheye-like inputs and will be refined.
+- Fisheye undistortion now checks for warped/folded remap grids; when they look unsafe it falls back to identity and logs `fallback=fold`.
+- ROI grid mode (plane-mode=roi_grid3x3) now samples the lower-center 3x3 cells of a conceptual 5x5 split (12-14, 17-19, 22-24).
 - Redistortion is currently a placeholder (identity). Images in 40_redist and after are visually same as 30_ai; the true inverse mapping will be implemented next.
 - If ffprobe is available in PATH, basic metadata is recorded in logs. Otherwise, pipeline still runs.
 
@@ -95,4 +97,6 @@ Next steps
 2) Add equirect 180 plane option and v360/cuda integration where available.
 3) Integrate AI restoration stage and ensure stereo consistency checks.
 4) Add VR metadata writing to the final muxed video output.
+
+
 

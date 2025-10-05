@@ -16,6 +16,7 @@ from VR.metadata.ffprobe_wrapper import FFprobe
 from VR.metadata.parser import detect_from_ffprobe
 from VR.utils.imageops import default_fisheye_params, Undistortor, hanning2d
 from VR.utils.projection import equirect_to_perspective, equirect_to_perspective_tiles, build_perspective_from_equirect_patch_map
+from VR.utils.roi_stitch import build_roi_grid3x3_combined, composite_back_from_combined
 
 Layout = Literal["auto", "sbs", "ou", "mono"]
 
@@ -173,8 +174,26 @@ class VRPipeline:
                 else:
                     plane_mode = "persp_single"
 
-            # ROI perspective mode (grid3x3 mid-lower region)
-            if isinstance(proj, str) and proj.startswith("equirect") and plane_mode == "roi_persp":
+            # ROI grid3x3 stitch mode (mid-lower)
+            if isinstance(proj, str) and proj.startswith("equirect") and plane_mode == "roi_grid3x3":
+                # Build combined small 2D from 3x3 parts
+                comb_left = build_roi_grid3x3_combined(left)
+                und_left = comb_left.image
+                roi_grid_state_left = comb_left
+                if right is not None:
+                    comb_right = build_roi_grid3x3_combined(right)
+                    und_right = comb_right.image
+                    roi_grid_state_right = comb_right
+                else:
+                    und_right = None
+                # Save
+                if save_this:
+                    self._save_img(os.path.join(self.stage_dirs["20_roi_left"], f"frame_{frame_idx:06d}_grid.jpg"), und_left)
+                    if und_right is not None:
+                        self._save_img(os.path.join(self.stage_dirs["20_roi_right"], f"frame_{frame_idx:06d}_grid.jpg"), und_right)
+                self.log.info("project:roi_grid3x3", frame_idx=frame_idx, mode=f"{proj}:roi_grid3x3")
+            # ROI perspective mode (legacy)
+            elif isinstance(proj, str) and proj.startswith("equirect") and plane_mode == "roi_persp":
                 # Define ROI rectangle from 3x3 grid: X in [W/6, 5W/6], Y in [H/2, 5H/6]
                 def roi_rect(w: int, h: int) -> tuple[int, int, int, int]:
                     return int(w/6), int(h/2), int(5*w/6), int(5*h/6)
@@ -265,8 +284,12 @@ class VRPipeline:
                 if right is not None:
                     und_right, _, info_r = self._undist.undistort_with_info(right, fish_params)
                 self.log.info("undistort:frame", frame_idx=frame_idx,
-                              left_valid_ratio=info_l.get("valid_ratio", None), left_fallback=info_l.get("fallback", None),
-                              right_valid_ratio=(info_r.get("valid_ratio") if info_r else None), right_fallback=(info_r.get("fallback") if info_r else None))
+                              left_valid_ratio=info_l.get("valid_ratio"), left_fallback=info_l.get("fallback"),
+                              left_fold_ratio_x=info_l.get("fold_ratio_x"), left_fold_ratio_y=info_l.get("fold_ratio_y"),
+                              right_valid_ratio=(info_r.get("valid_ratio") if info_r else None),
+                              right_fallback=(info_r.get("fallback") if info_r else None),
+                              right_fold_ratio_x=(info_r.get("fold_ratio_x") if info_r else None),
+                              right_fold_ratio_y=(info_r.get("fold_ratio_y") if info_r else None))
 
             if save_this:
                 self._save_img(os.path.join(self.stage_dirs["20_undist_left"], f"frame_{frame_idx:06d}.jpg"), und_left)
@@ -276,7 +299,7 @@ class VRPipeline:
             # Stage 30: AI (pilot = passthrough)
             ai_left = und_left
             ai_right = und_right
-            # If ROI mode, save AI ROI images
+            # If ROI persp mode, save AI ROI images
             if 'roi_state_left' in locals():
                 for idx_v, v in enumerate(roi_state_left):
                     ai_img = v["img"]  # passthrough
@@ -296,7 +319,14 @@ class VRPipeline:
                     self._save_img(os.path.join(self.stage_dirs["30_ai_right"], f"frame_{frame_idx:06d}.jpg"), ai_right)
 
             # Stage 40: redistort back
-            if 'roi_state_left' in locals():
+            if 'roi_grid_state_left' in locals():
+                # Redist from combined small 2D back to full split image
+                red_left = composite_back_from_combined(left, ai_left if ai_left is not None else roi_grid_state_left.image, roi_grid_state_left.maps, feather=12)
+                if right is not None and 'roi_grid_state_right' in locals():
+                    red_right = composite_back_from_combined(right, ai_right if ai_right is not None else roi_grid_state_right.image, roi_grid_state_right.maps, feather=12)
+                else:
+                    red_right = None
+            elif 'roi_state_left' in locals():
                 # Composite ROI views back to the split-sized images with feathered blending
                 canvas_left = left.copy()
                 for v in roi_state_left:

@@ -88,6 +88,17 @@ class Undistortor:
             map1, map2 = cached
         return map1, map2, new_K
 
+    def _fold_ratio(self, map_arr: np.ndarray, axis: int) -> float:
+        diffs = np.diff(map_arr, axis=axis)
+        if diffs.size == 0:
+            return 0.0
+        finite = np.isfinite(diffs)
+        if not finite.any():
+            return 0.0
+        diffs = diffs[finite]
+        bad = diffs < -1e-3
+        return float(bad.sum()) / float(diffs.size)
+
     def _valid_ratio(self, map1: np.ndarray, map2: np.ndarray, w: int, h: int) -> float:
         # Count how many mapped coords fall inside the source image
         valid_x = (map1 >= 0.0) & (map1 <= (w - 1))
@@ -99,12 +110,19 @@ class Undistortor:
         h, w = img.shape[:2]
         map1, map2, new_K = self.maps_for_rectified(w, h, params, balance=1.0)
         vr = self._valid_ratio(map1, map2, w, h)
-        info = {"valid_ratio": vr, "fallback": False}
+        fold_x = self._fold_ratio(map1, axis=1)
+        fold_y = self._fold_ratio(map2, axis=0)
+        info = {"valid_ratio": vr, "fold_ratio_x": fold_x, "fold_ratio_y": fold_y, "fallback": None}
+        fallback_reason = None
         if vr < 0.2:
-            # Too many samples out of bounds; fallback to identity remap
+            fallback_reason = "oob"
+        elif fold_x > 0.1 or fold_y > 0.1:
+            fallback_reason = "fold"
+        if fallback_reason is not None:
+            # Too many samples out of bounds or the map folds back on itself; fallback to identity remap
             imap1, imap2 = self._identity_maps(w, h)
             rectified = cv2.remap(img, imap1, imap2, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-            info["fallback"] = True
+            info["fallback"] = fallback_reason
             return rectified, new_K, info
         rectified = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
         return rectified, new_K, info
