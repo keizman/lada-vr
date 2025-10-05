@@ -14,8 +14,8 @@ import numpy as np
 from VR.utils.jsonl_logger import JsonlLogger
 from VR.metadata.ffprobe_wrapper import FFprobe
 from VR.metadata.parser import detect_from_ffprobe
-from VR.utils.imageops import default_fisheye_params, Undistortor
-from VR.utils.projection import equirect_to_perspective, equirect_to_perspective_tiles
+from VR.utils.imageops import default_fisheye_params, Undistortor, hanning2d
+from VR.utils.projection import equirect_to_perspective, equirect_to_perspective_tiles, build_perspective_from_equirect_patch_map
 
 Layout = Literal["auto", "sbs", "ou", "mono"]
 
@@ -38,7 +38,7 @@ class PipelineConfig:
     out_dir: str
     layout: Layout = "auto"
     projection: str = "auto"  # auto | fisheye180 | equirect180 | equirect360
-    plane_mode: str = "auto"   # auto | persp_single | persp_tiles | equirect_plane
+    plane_mode: str = "auto"   # auto | persp_single | persp_tiles | equirect_plane | roi_persp
     fov_deg: float = 110.0
     yaw_deg: float = 0.0
     pitch_deg: float = 0.0
@@ -62,8 +62,12 @@ class VRPipeline:
             "10_split_right": os.path.join(cfg.out_dir, "stages", "10_split", "right"),
             "20_undist_left": os.path.join(cfg.out_dir, "stages", "20_undist", "left"),
             "20_undist_right": os.path.join(cfg.out_dir, "stages", "20_undist", "right"),
+            "20_roi_left": os.path.join(cfg.out_dir, "stages", "20_roi", "left"),
+            "20_roi_right": os.path.join(cfg.out_dir, "stages", "20_roi", "right"),
             "30_ai_left": os.path.join(cfg.out_dir, "stages", "30_ai", "left"),
             "30_ai_right": os.path.join(cfg.out_dir, "stages", "30_ai", "right"),
+            "30_ai_roi_left": os.path.join(cfg.out_dir, "stages", "30_ai_roi", "left"),
+            "30_ai_roi_right": os.path.join(cfg.out_dir, "stages", "30_ai_roi", "right"),
             "40_redist_left": os.path.join(cfg.out_dir, "stages", "40_redist", "left"),
             "40_redist_right": os.path.join(cfg.out_dir, "stages", "40_redist", "right"),
             "50_recompose_sbs": os.path.join(cfg.out_dir, "stages", "50_recompose_sbs"),
@@ -169,7 +173,58 @@ class VRPipeline:
                 else:
                     plane_mode = "persp_single"
 
-            if isinstance(proj, str) and proj.startswith("equirect"):
+            # ROI perspective mode (grid3x3 mid-lower region)
+            if isinstance(proj, str) and proj.startswith("equirect") and plane_mode == "roi_persp":
+                # Define ROI rectangle from 3x3 grid: X in [W/6, 5W/6], Y in [H/2, 5H/6]
+                def roi_rect(w: int, h: int) -> tuple[int, int, int, int]:
+                    return int(w/6), int(h/2), int(5*w/6), int(5*h/6)
+
+                # Helper to compute ROI views (single for 180, dual for 360)
+                def roi_views_for(projection: str, w: int, h: int, left_img: np.ndarray):
+                    x0, y0, x1, y1 = roi_rect(w, h)
+                    cx = (x0 + x1) / 2.0
+                    cy = (y0 + y1) / 2.0
+                    # equirect pixel -> (lon,lat)
+                    lon_center = (cx / float(w)) * 360.0 - 180.0
+                    lat_center = (0.5 - (cy / float(h))) * 180.0
+                    if projection == "equirect180":
+                        yaws = [lon_center]
+                    else:
+                        yaws = [lon_center - 60.0, lon_center + 60.0]
+                    fov_h = 120.0
+                    out_w = min(1024, w)
+                    out_h = max(256, out_w // 2)
+                    views = []
+                    for yaw in yaws:
+                        img_roi = equirect_to_perspective(left_img, out_w, out_h, fov_h, yaw_deg=float(yaw), pitch_deg=float(lat_center), roll_deg=0.0)
+                        alpha = hanning2d(out_w, out_h, border=max(8, out_w//16)).astype(np.float32)
+                        # Precompute inverse maps for the patch
+                        patch_w = x1 - x0
+                        patch_h = y1 - y0
+                        mx, my, valid = build_perspective_from_equirect_patch_map(w, h, out_w, out_h, fov_h, float(yaw), float(lat_center), 0.0, x0, y0, patch_w, patch_h)
+                        views.append({"yaw": yaw, "pitch": lat_center, "fov_h": fov_h,
+                                      "out_w": out_w, "out_h": out_h, "img": img_roi, "alpha": alpha,
+                                      "patch": {"x0": x0, "y0": y0, "w": patch_w, "h": patch_h, "mx": mx, "my": my, "valid": valid}})
+                    return views
+
+                # Compute views for left/right
+                views_left = roi_views_for(proj, per_w, per_h, left)
+                views_right = roi_views_for(proj, per_w, per_h, right) if right is not None else None
+                # Save small ROI images for inspection
+                if save_this:
+                    for idx_v, v in enumerate(views_left):
+                        self._save_img(os.path.join(self.stage_dirs["20_roi_left"], f"frame_{frame_idx:06d}_v{idx_v}.jpg"), v["img"])
+                    if views_right is not None:
+                        for idx_v, v in enumerate(views_right):
+                            self._save_img(os.path.join(self.stage_dirs["20_roi_right"], f"frame_{frame_idx:06d}_v{idx_v}.jpg"), v["img"])
+                # For downstream, set und_left/right to mosaics of ROI (for stage continuity)
+                und_left = views_left[0]["img"]
+                und_right = views_right[0]["img"] if views_right is not None else None
+                # Stash views for redist
+                roi_state_left = views_left
+                roi_state_right = views_right
+                self.log.info("project:roi", frame_idx=frame_idx, mode=f"{proj}:roi_persp", views=len(views_left))
+            elif isinstance(proj, str) and proj.startswith("equirect"):
                 coverage = "180" if proj == "equirect180" else "360"
                 if plane_mode == "equirect_plane":
                     und_left = left
@@ -221,14 +276,80 @@ class VRPipeline:
             # Stage 30: AI (pilot = passthrough)
             ai_left = und_left
             ai_right = und_right
+            # If ROI mode, save AI ROI images
+            if 'roi_state_left' in locals():
+                for idx_v, v in enumerate(roi_state_left):
+                    ai_img = v["img"]  # passthrough
+                    if save_this:
+                        self._save_img(os.path.join(self.stage_dirs["30_ai_roi_left"], f"frame_{frame_idx:06d}_v{idx_v}.jpg"), ai_img)
+                    v["ai_img"] = ai_img
+                if roi_state_right is not None:
+                    for idx_v, v in enumerate(roi_state_right):
+                        ai_img = v["img"]
+                        if save_this:
+                            self._save_img(os.path.join(self.stage_dirs["30_ai_roi_right"], f"frame_{frame_idx:06d}_v{idx_v}.jpg"), ai_img)
+                        v["ai_img"] = ai_img
+            # Also keep old 30_ai stage for continuity
             if save_this:
                 self._save_img(os.path.join(self.stage_dirs["30_ai_left"], f"frame_{frame_idx:06d}.jpg"), ai_left)
                 if ai_right is not None:
                     self._save_img(os.path.join(self.stage_dirs["30_ai_right"], f"frame_{frame_idx:06d}.jpg"), ai_right)
 
-            # Stage 40: redistort back (pilot stub = identity)
-            red_left = self._undist.redistort_stub(ai_left)
-            red_right = self._undist.redistort_stub(ai_right) if ai_right is not None else None
+            # Stage 40: redistort back
+            if 'roi_state_left' in locals():
+                # Composite ROI views back to the split-sized images with feathered blending
+                canvas_left = left.copy()
+                for v in roi_state_left:
+                    x0 = v["patch"]["x0"]; y0 = v["patch"]["y0"]; pw = v["patch"]["w"]; ph = v["patch"]["h"]
+                    mx = v["patch"]["mx"]; my = v["patch"]["my"]
+                    ai_img = v.get("ai_img", v["img"])
+                    # Map AI ROI to patch
+                    patch_img = cv2.remap(ai_img, mx, my, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+                    # Map alpha to patch
+                    alpha_roi = v["alpha"]
+                    patch_alpha = cv2.remap(alpha_roi, mx, my, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+                    patch_alpha = np.clip(patch_alpha, 0.0, 1.0).astype(np.float32)
+                    # Blend into canvas
+                    roi_region = canvas_left[y0:y0+ph, x0:x0+pw]
+                    if roi_region.shape[:2] != patch_img.shape[:2]:
+                        # Safety check
+                        continue
+                    if patch_img.dtype != np.uint8:
+                        patch_img = patch_img.astype(np.uint8)
+                    # Ensure float blending
+                    roi_f = roi_region.astype(np.float32)
+                    patch_f = patch_img.astype(np.float32)
+                    alpha_f = patch_alpha[..., None]  # HxWx1
+                    blended = (1.0 - alpha_f) * roi_f + alpha_f * patch_f
+                    canvas_left[y0:y0+ph, x0:x0+pw] = np.clip(blended, 0, 255).astype(np.uint8)
+                red_left = canvas_left
+                if right is not None and roi_state_right is not None:
+                    canvas_right = right.copy()
+                    for v in roi_state_right:
+                        x0 = v["patch"]["x0"]; y0 = v["patch"]["y0"]; pw = v["patch"]["w"]; ph = v["patch"]["h"]
+                        mx = v["patch"]["mx"]; my = v["patch"]["my"]
+                        ai_img = v.get("ai_img", v["img"])
+                        patch_img = cv2.remap(ai_img, mx, my, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+                        alpha_roi = v["alpha"]
+                        patch_alpha = cv2.remap(alpha_roi, mx, my, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+                        patch_alpha = np.clip(patch_alpha, 0.0, 1.0).astype(np.float32)
+                        roi_region = canvas_right[y0:y0+ph, x0:x0+pw]
+                        if roi_region.shape[:2] != patch_img.shape[:2]:
+                            continue
+                        if patch_img.dtype != np.uint8:
+                            patch_img = patch_img.astype(np.uint8)
+                        roi_f = roi_region.astype(np.float32)
+                        patch_f = patch_img.astype(np.float32)
+                        alpha_f = patch_alpha[..., None]
+                        blended = (1.0 - alpha_f) * roi_f + alpha_f * patch_f
+                        canvas_right[y0:y0+ph, x0:x0+pw] = np.clip(blended, 0, 255).astype(np.uint8)
+                    red_right = canvas_right
+                else:
+                    red_right = None
+            else:
+                red_left = self._undist.redistort_stub(ai_left)
+                red_right = self._undist.redistort_stub(ai_right) if ai_right is not None else None
+
             if save_this:
                 self._save_img(os.path.join(self.stage_dirs["40_redist_left"], f"frame_{frame_idx:06d}.jpg"), red_left)
                 if red_right is not None:

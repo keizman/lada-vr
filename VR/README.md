@@ -20,16 +20,17 @@ For an output root OUT_DIR, stage images are saved under OUT_DIR/stages/...
     - OUT_DIR/stages/10_split/right/frame_XXXXXX.jpg
 
 - 20_undist/
-  - If projection is equirect (360/180): three plane modes are available
+  - If projection is equirect (360/180): plane modes
     - equirect_plane: keep equirect as the processing plane (no geometric change)
     - persp_single: a single perspective view (configurable FOV/yaw/pitch/roll)
-    - persp_tiles: multiple perspective views covering the full sphere/hemisphere; the stage saves:
-      - a mosaic preview per frame (frame_XXXXXX.jpg) and
-      - per-tile images under frame_XXXXXX/tile_R_C.jpg
+    - persp_tiles: multiple perspective views covering the full sphere/hemisphere; the stage saves a mosaic and per-tile images
+    - roi_persp: a small undistorted ROI extracted from the mid-lower 3x3 grid region (X∈[W/6,5W/6], Y∈[H/2,5H/6]); equirect180 uses single view; equirect360 uses two views (±60° yaw)
+      - ROI images saved to OUT_DIR/stages/20_roi/left|right/frame_XXXXXX_vN.jpg
   - If projection is fisheye180: this stage saves fisheye undistorted (rectified) images using OpenCV fisheye model.
   - Paths:
     - OUT_DIR/stages/20_undist/left/frame_XXXXXX.jpg (mosaic or single/preserved)
     - OUT_DIR/stages/20_undist/left/frame_XXXXXX/tile_R_C.jpg (if tiles enabled)
+    - OUT_DIR/stages/20_roi/... (if roi_persp)
     - OUT_DIR/stages/20_undist/right/... (same for right eye if present)
 
 - 30_ai/
@@ -39,7 +40,8 @@ For an output root OUT_DIR, stage images are saved under OUT_DIR/stages/...
     - OUT_DIR/stages/30_ai/right/frame_XXXXXX.jpg
 
 - 40_redist/
-  - Placeholder redistortion stage (currently identity). Will later map the AI-restored plane back to the original projection.
+  - Redistortion stage: maps the processed plane back to the original split-sized images.
+    - In roi_persp mode: ROI views are composited back onto the split-sized images with Hanning feathering to avoid seams.
   - Paths:
     - OUT_DIR/stages/40_redist/left/frame_XXXXXX.jpg
     - OUT_DIR/stages/40_redist/right/frame_XXXXXX.jpg
@@ -74,6 +76,12 @@ Running the pipeline (examples)
       --out-dir "K:\\tmp\\v\\code\\demosaic\\VR_out\\pilot_tiles" \
       --layout sbs --projection equirect360 --plane-mode persp_tiles \
       --tiles-x 4 --tiles-y 2 --fov 100 --save-every-n 10 --max-frames 600
+  - ROI mid-lower small views (recommended for testing without full coverage):
+    - python VR/cli/run_pipeline.py \
+      --input "K:\\tmp\\v\\code\\demosaic\\8199881-4k-1m.mp4" \
+      --out-dir "K:\\tmp\\v\\code\\demosaic\\VR_out\\pilot_roi" \
+      --layout sbs --projection equirect360 --plane-mode roi_persp \
+      --fov 120 --save-every-n 10 --max-frames 600
 
 Notes
 - Undistortion parameters (fisheye defaults):

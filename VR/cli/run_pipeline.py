@@ -17,7 +17,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", required=True, help="Output directory for logs/stages")
     p.add_argument("--layout", default="auto", choices=["auto", "sbs", "ou", "mono"], help="Force layout or auto-detect")
     p.add_argument("--projection", default="auto", choices=["auto", "fisheye180", "equirect180", "equirect360"], help="Input projection model")
-    p.add_argument("--plane-mode", default="auto", choices=["auto", "persp_single", "persp_tiles", "equirect_plane"], help="Processing plane mode for equirect inputs")
+    p.add_argument("--plane-mode", default="auto", choices=["auto", "persp_single", "persp_tiles", "equirect_plane", "roi_persp"], help="Processing plane mode for equirect inputs")
     p.add_argument("--tiles-x", type=int, default=4, help="Tiles across yaw for persp_tiles")
     p.add_argument("--tiles-y", type=int, default=2, help="Tiles across pitch for persp_tiles")
     p.add_argument("--fov", type=float, default=110.0, help="Perspective FOV in degrees (single/tiles)")
