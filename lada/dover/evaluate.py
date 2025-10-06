@@ -18,7 +18,7 @@ from lada.dover.models import DOVER
 class VideoQualityEvaluator:
     def __init__(self, device=None):
         """Setup to load the model and configurations"""
-        if device is not None:
+        if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device

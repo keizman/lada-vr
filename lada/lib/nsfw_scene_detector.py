@@ -17,7 +17,7 @@ from lada.lib import Mask, Image, Box, VideoMetadata, threading_utils, video_uti
 from lada.lib import mask_utils
 from lada.lib.scene_utils import crop_to_box_v3
 from lada.lib.threading_utils import wait_until_completed
-from lada.lib.ultralytics_utils import choose_biggest_detection, convert_yolo_mask, convert_yolo_box
+from lada.lib.ultralytics_utils import choose_biggest_detection, convert_yolo_mask, convert_yolo_box, resolve_torch_device
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOG_LEVEL)
@@ -319,9 +319,16 @@ def apply_random_mask_extensions(scene: Scene):
 
 
 class NsfwDetector:
-    def __init__(self, nsfw_detection_model: YOLO, device: str, file_queue: queue.Queue, frame_queue: queue.Queue, scene_queue: queue.Queue, file_processing_options: FileProcessingOptions, random_extend_masks=True):
+    def __init__(self, nsfw_detection_model: YOLO, device: str, file_queue: queue.Queue, frame_queue: queue.Queue, scene_queue: queue.Queue, file_processing_options: FileProcessingOptions, random_extend_masks=True, state_file_lock=None):
         self.nsfw_detection_model: YOLO = nsfw_detection_model
-        self.device = torch.device(device) if device is not None else device
+        self.device, self._torch_device = resolve_torch_device(device, description="NSFW detection device")
+        try:
+            self.nsfw_detection_model.to(self._torch_device)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to place NSFW detection model on '{self.device}'."
+            ) from exc
+        self._use_half_precision = self.device.startswith("cuda")
         self.file_queue: queue.Queue = file_queue
         self.frame_queue: queue.Queue = frame_queue
         self.scene_queue: queue.Queue = scene_queue
@@ -331,6 +338,7 @@ class NsfwDetector:
         self.previous_completed_scene_frame_end: Dict[str, Optional[int]] = {}
         self.scenes_counter: Dict[str, int] = {}
         self.random_extend_masks = random_extend_masks
+        self._state_file_lock = state_file_lock
 
         self.stop_requested = False
         self.thread_pool = concurrent_futures.ThreadPoolExecutor()
@@ -353,11 +361,18 @@ class NsfwDetector:
                         self.files_already_processed.add(file_path.strip())
 
     def _mark_file_as_processed(self, text_file: pathlib.Path, path_to_save: str):
-        if not text_file.exists():
-            text_file.parent.mkdir(parents=True, exist_ok=True)
-            text_file.touch()
-        with open(text_file, 'a', encoding='utf-8') as f:
-            f.write(f"{path_to_save}\n")
+        def _append():
+            if not text_file.exists():
+                text_file.parent.mkdir(parents=True, exist_ok=True)
+                text_file.touch()
+            with open(text_file, 'a', encoding='utf-8') as f:
+                f.write(f"{path_to_save}\n")
+
+        if self._state_file_lock:
+            with self._state_file_lock:
+                _append()
+        else:
+            _append()
 
     def _file_already_processed(self, path_to_check: str):
         return str(path_to_check) in self.files_already_processed and os.path.exists(path_to_check)
@@ -407,7 +422,11 @@ class NsfwDetector:
         return video_metadata
 
     def add_files(self, video_files):
-        for file_index, file_path in enumerate(video_files):
+        for fallback_idx, entry in enumerate(video_files):
+            if isinstance(entry, tuple):
+                file_index, file_path = entry
+            else:
+                file_index, file_path = fallback_idx, entry
             self.file_queue.put((file_index, file_path))
         self.file_queue.put(None)
 
@@ -430,7 +449,15 @@ class NsfwDetector:
                 self._init_new_file(video_metadata)
             nsfw_frame = None
             print(f"{video_file_index}, Processing {pathlib.Path(video_file_path).name}")
-            for frame_num, results in enumerate(self.nsfw_detection_model.track(source=video_metadata.video_file, stream=True, verbose=False, tracker="bytetrack.yaml", device=self.device)):
+            for frame_num, results in enumerate(self.nsfw_detection_model.track(
+                    source=video_metadata.video_file,
+                    stream=True,
+                    verbose=False,
+                    tracker="bytetrack.yaml",
+                    device=self.device,
+                    imgsz=640,
+                    half=self._use_half_precision
+                )):
                 if nsfw_frame:
                     self.frame_queue.put(nsfw_frame)
                     if self.stop_requested:

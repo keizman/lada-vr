@@ -1,6 +1,6 @@
 from typing import Optional
 
-from lada.lib.ultralytics_utils import convert_yolo_boxes
+from lada.lib.ultralytics_utils import convert_yolo_boxes, resolve_torch_device
 from lada.lib.scene_utils import box_overlap
 from lada.lib import Image, Box
 from ultralytics import YOLO
@@ -14,7 +14,13 @@ NSFW_CLASS_IDS = (MALE_GENITALIA_EXPOSED, FEMALE_GENITALIA_EXPOSED)
 class NudeNetNsfwDetector:
     def __init__(self, model: YOLO, device):
         self.model = model
-        self.device = device
+        self.device, torch_device = resolve_torch_device(device, description="NudeNet detector device")
+        try:
+            self.model.to(torch_device)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to place NudeNet NSFW detector on '{self.device}'."
+            ) from exc
         self.batch_size = 4
         self.min_confidence = 0.15
         self.min_positive_detections = 6

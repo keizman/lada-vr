@@ -347,7 +347,8 @@ class SceneProcessor:
         self.censor_detector = censoring_detector
 
     def process_scene(self, scene: Scene, output_dir: Path, scene_processing_options: SceneProcessingOptions):
-        print("Started processing scene", scene.id)
+        video_name = Path(scene.video_meta_data.video_file).name if scene and scene.video_meta_data else "unknown"
+        print(f"Started processing scene {scene.id} from {video_name}")
         cropped_scene = CroppedScene(scene, target_size=(scene_processing_options.out_size,scene_processing_options.out_size), border_size=0.08)
 
         dataset_item_mosaic_crop_unscaled: Optional[DatasetItem] = None
@@ -505,4 +506,4 @@ class SceneProcessor:
             if scene_processing_options.save_uncropped:
                 io_futures.extend(dataset_item_uncropped.save(output_dir, scene, False, scene_processing_options.save_as_images, scene_processing_options.save_flat,  scene.video_meta_data.video_fps, io_executor))
         wait_until_completed(io_futures)
-        print("Finished processing scene", scene.id)
+        print(f"Finished processing scene {scene.id} from {video_name}")

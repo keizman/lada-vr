@@ -2,13 +2,30 @@
 import argparse
 import os
 import sys
+from typing import Tuple
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from VR.pipeline import VRPipeline, PipelineConfig  # type: ignore
+from VR.undist import list_undistort_modes  # type: ignore
 from VR.utils.jsonl_logger import JsonlLogger  # type: ignore
+
+
+def _parse_resolution(value: str) -> Tuple[int, int]:
+    cleaned = value.lower().replace(" ", "")
+    if "x" not in cleaned:
+        raise argparse.ArgumentTypeError("Resolution must be formatted as WIDTHxHEIGHT, e.g. 3840x2160")
+    w_str, h_str = cleaned.split("x", 1)
+    try:
+        width = int(w_str)
+        height = int(h_str)
+    except ValueError as exc:  # pragma: no cover - argparse handles error
+        raise argparse.ArgumentTypeError("Resolution components must be integers") from exc
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("Resolution components must be positive")
+    return width, height
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +43,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--roll", type=float, default=0.0, help="Roll in degrees (single mode)")
     p.add_argument("--save-every-n", type=int, default=10, help="Save stage images every N frames")
     p.add_argument("--max-frames", type=int, default=None, help="Limit frames processed for pilot runs")
+    available_modes = tuple(list_undistort_modes())
+    p.add_argument("--undist-mode", default="opencv_default", choices=available_modes, help="Undistortion strategy")
+    p.add_argument("--undist-calibration", default=None, help="Calibration file required by calibrated/woodscape strategies")
+    p.add_argument("--undist-balance", type=float, default=None, help="Balance factor used by OpenCV calibrated fisheye modes (default=1.0)")
+    p.add_argument("--undist-reference", type=_parse_resolution, default=None, help="Reference resolution for calibration scaling (e.g. 3840x2160)")
+    p.add_argument("--undist-hfov", type=float, default=None, help="Horizontal FOV in degrees for Woodscape cylindrical mode (default 190)")
+    p.add_argument("--undist-vfov", type=float, default=None, help="Vertical FOV in degrees for Woodscape cylindrical mode (default 143)")
     return p.parse_args()
 
 
@@ -35,6 +59,18 @@ def main() -> None:
     log_path = os.path.join(args.out_dir, "logs", "pipeline.jsonl")
     logger = JsonlLogger(log_path)
     try:
+        undist_params = {}
+        if args.undist_calibration:
+            undist_params["calibration_path"] = args.undist_calibration
+        if args.undist_balance is not None:
+            undist_params["balance"] = args.undist_balance
+        if args.undist_reference is not None:
+            undist_params["reference_size"] = args.undist_reference
+        if args.undist_hfov is not None:
+            undist_params["hfov_deg"] = args.undist_hfov
+        if args.undist_vfov is not None:
+            undist_params["vfov_deg"] = args.undist_vfov
+
         cfg = PipelineConfig(
             input_path=args.input,
             out_dir=args.out_dir,
@@ -49,6 +85,8 @@ def main() -> None:
             roll_deg=args.roll,
             save_every_n=args.save_every_n,
             max_frames=args.max_frames,
+            undist_mode=args.undist_mode,
+            undist_params=undist_params,
         )
         runner = VRPipeline(cfg, logger)
         summary = runner.run()
@@ -60,4 +98,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

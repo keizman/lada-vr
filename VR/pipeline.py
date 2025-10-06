@@ -1,7 +1,8 @@
-from dataclasses import dataclass
-from typing import Optional, Literal, Dict, Any
+from dataclasses import dataclass, field
+from typing import Optional, Literal, Dict, Any, List, Tuple
 import os
 import time
+import re
 
 try:
     import cv2  # type: ignore
@@ -14,9 +15,10 @@ import numpy as np
 from VR.utils.jsonl_logger import JsonlLogger
 from VR.metadata.ffprobe_wrapper import FFprobe
 from VR.metadata.parser import detect_from_ffprobe
-from VR.utils.imageops import default_fisheye_params, Undistortor, hanning2d
+from VR.utils.imageops import default_fisheye_params, hanning2d
 from VR.utils.projection import equirect_to_perspective, equirect_to_perspective_tiles, build_perspective_from_equirect_patch_map
 from VR.utils.roi_stitch import build_roi_grid3x3_combined, composite_back_from_combined
+from VR.undist import build_undistorter
 
 Layout = Literal["auto", "sbs", "ou", "mono"]
 
@@ -48,6 +50,15 @@ class PipelineConfig:
     tiles_y: int = 2
     save_every_n: int = 10  # save stage images every N frames
     max_frames: Optional[int] = None
+    undist_mode: str = "opencv_default"
+    undist_params: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class VariantSpec:
+    label: str
+    mode: str
+    params: Dict[str, Any]
 
 
 class VRPipeline:
@@ -76,10 +87,137 @@ class VRPipeline:
         for d in self.stage_dirs.values():
             os.makedirs(d, exist_ok=True)
         os.makedirs(os.path.join(cfg.out_dir, "logs"), exist_ok=True)
-        self._undist = Undistortor()
+        self._repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        undist_params = dict(cfg.undist_params)
+        if cfg.undist_mode == "auto_lines":
+            undist_params.setdefault("input_path", cfg.input_path)
+        self._undist_label = self._slug_label(cfg.undist_mode)
+        try:
+            self._undist = build_undistorter(cfg.undist_mode, params=undist_params)
+        except Exception as exc:
+            self.log.info("undistort:build_failed", mode=cfg.undist_mode, error=str(exc))
+            undist_params = {}
+            self._undist_label = self._slug_label("fallback_default")
+            self._undist = build_undistorter("opencv_default", params={})
+        cfg.undist_params = undist_params
+        if cfg.undist_mode == "auto_lines":
+            meta = undist_params.get("_auto_meta") if isinstance(undist_params, dict) else None
+            cache_path = undist_params.get("_auto_cache") if isinstance(undist_params, dict) else None
+            if meta:
+                self.log.info("undistort:auto_lines", cache=cache_path, score=meta.get("score"), segments=meta.get("segments_used"), frames=meta.get("frames_sampled"), cache_hit=meta.get("cache_hit"))
+        self._variant_unavailable: Dict[str, str] = {}
+        self._extra_variants: List[Tuple[str, Any]] = []
+        self._extra_variant_dirs: Dict[str, Dict[str, str]] = {}
+        self._prepare_extra_undistorters()
 
     def _save_img(self, path: str, img: np.ndarray) -> None:
         cv2.imwrite(path, img)
+
+    @staticmethod
+    def _slug_label(value: str) -> str:
+        slug = re.sub(r'[^a-z0-9]+', '_', value.lower()).strip('_')
+        return slug or 'variant'
+
+    def _locate_calibration_file(self, filenames: List[str], search_roots: List[str]) -> Optional[str]:
+        for fname in filenames:
+            for rel_root in search_roots:
+                base = os.path.join(self._repo_root, rel_root)
+                if not os.path.isdir(base):
+                    continue
+                for root, _dirs, files in os.walk(base):
+                    if fname in files:
+                        return os.path.join(root, fname)
+        return None
+
+    def _discover_variant_specs(self) -> List[VariantSpec]:
+        self._variant_unavailable = {}
+        specs: List[VariantSpec] = []
+
+        charuco_path = self._locate_calibration_file(
+            ['fisheye_calibration.json'],
+            ['tmp/Fisheye_ChArUco_Calibration', 'configs']
+        )
+        if charuco_path:
+            specs.append(VariantSpec(label='charuco', mode='opencv_charuco', params={'calibration_path': charuco_path}))
+        else:
+            self._variant_unavailable['charuco'] = 'calibration_not_found'
+
+        chessboard_path = self._locate_calibration_file(
+            ['fisheye_calibration_data.json'],
+            ['tmp/opencv-fisheye-undistortion', 'configs']
+        )
+        if chessboard_path:
+            specs.append(VariantSpec(label='chessboard', mode='opencv_chessboard', params={'calibration_path': chessboard_path}))
+        else:
+            self._variant_unavailable['chessboard'] = 'calibration_not_found'
+
+        woodscape_path = self._locate_calibration_file(
+            ['woodscape_calibration.json', 'woodscape.json', 'woodscape_calib.json'],
+            ['tmp', 'configs']
+        )
+        if woodscape_path:
+            specs.append(VariantSpec(label='woodscape', mode='woodscape_cylindrical', params={'calibration_path': woodscape_path}))
+        else:
+            self._variant_unavailable['woodscape'] = 'calibration_not_found'
+
+        return specs
+
+    def _prepare_extra_undistorters(self) -> None:
+        specs = self._discover_variant_specs()
+        if self._variant_unavailable:
+            for label, reason in self._variant_unavailable.items():
+                self.log.info('undistort:variant_unavailable', label=label, reason=reason)
+
+        if not specs:
+            self.log.info('undistort:variant_none', fallback_mode=self.cfg.undist_mode, note='edges remain warped without calibration')
+
+        for spec in specs:
+            label_slug = self._slug_label(spec.label)
+            if label_slug == self._undist_label:
+                label_slug = f"{label_slug}_alt"
+            try:
+                variant = build_undistorter(spec.mode, params=spec.params)
+            except Exception as exc:  # pragma: no cover - optional calibrations
+                self.log.info('undistort:variant_skip', label=label_slug, reason=str(exc))
+                continue
+            self._extra_variants.append((label_slug, variant))
+            left_dir = os.path.join(self.cfg.out_dir, 'stages', f'20_undist_{label_slug}', 'left')
+            right_dir = os.path.join(self.cfg.out_dir, 'stages', f'20_undist_{label_slug}', 'right')
+            os.makedirs(left_dir, exist_ok=True)
+            os.makedirs(right_dir, exist_ok=True)
+            self._extra_variant_dirs[label_slug] = {'left': left_dir, 'right': right_dir}
+            self.log.info('undistort:variant_enabled', label=label_slug, mode=spec.mode, calibration=spec.params.get('calibration_path'))
+
+        if self._extra_variants:
+            active = [label for label, _ in self._extra_variants]
+            self.log.info('undistort:variants_ready', labels=active)
+
+    def _generate_extra_undist_outputs(self, frame_idx: int, left: np.ndarray, right: Optional[np.ndarray], params: Any) -> None:
+        for label, variant in self._extra_variants:
+            try:
+                res_left = variant.undistort(left, params)
+            except Exception as exc:  # pragma: no cover - optional calibrations
+                self.log.info('undistort:variant_error', frame_idx=frame_idx, label=label, eye='left', error=str(exc))
+                continue
+            left_dir = self._extra_variant_dirs[label]['left']
+            self._save_img(os.path.join(left_dir, f'frame_{frame_idx:06d}.jpg'), res_left.image)
+            info_left = res_left.info or {}
+            info_right: Dict[str, Any] = {}
+            if right is not None:
+                try:
+                    res_right = variant.undistort(right, params)
+                    right_dir = self._extra_variant_dirs[label]['right']
+                    self._save_img(os.path.join(right_dir, f'frame_{frame_idx:06d}.jpg'), res_right.image)
+                    info_right = res_right.info or {}
+                except Exception as exc:  # pragma: no cover - optional calibrations
+                    self.log.info('undistort:variant_error', frame_idx=frame_idx, label=label, eye='right', error=str(exc))
+            self.log.info('undistort:variant',
+                          frame_idx=frame_idx,
+                          label=label,
+                          left_mode=info_left.get('mode'),
+                          left_valid_ratio=info_left.get('valid_ratio'),
+                          right_mode=(info_right.get('mode') if info_right else None),
+                          right_valid_ratio=(info_right.get('valid_ratio') if info_right else None))
 
     def run(self) -> Dict[str, Any]:
         # Stage: metadata
@@ -108,6 +246,7 @@ class VRPipeline:
                 self.cfg.pitch_deg = float(pose.get("pitch", 0.0))
                 self.cfg.roll_deg = float(pose.get("roll", 0.0))
         self.log.info("pipeline:start", width=width, height=height, fps=fps, frames_total=frames_total, layout=layout)
+        self.log.info("undistort:mode", mode=self.cfg.undist_mode, has_params=bool(self.cfg.undist_params))
 
         # Determine projection mode
         if self.cfg.projection == "auto":
@@ -278,18 +417,30 @@ class VRPipeline:
                                     self._save_img(tile_path, tiles_r[r][c])
                     self.log.info("project:frame", frame_idx=frame_idx, mode=f"{proj}:persp_tiles", tiles_x=self.cfg.tiles_x, tiles_y=self.cfg.tiles_y, fov=self.cfg.fov_deg)
             else:
-                # Fisheye -> rectified plane (as before, with safety)
-                und_left, _, info_l = self._undist.undistort_with_info(left, fish_params)
-                info_r = None
+                # Fisheye -> rectified plane (strategy-dependent safety)
+                result_left = self._undist.undistort(left, fish_params)
+                und_left = result_left.image
+                info_l = result_left.info or {}
+                result_right = None
+                und_right = None
                 if right is not None:
-                    und_right, _, info_r = self._undist.undistort_with_info(right, fish_params)
+                    result_right = self._undist.undistort(right, fish_params)
+                    und_right = result_right.image
+                info_r = (result_right.info if result_right else None) or {}
+                if not self._extra_variants and self.cfg.undist_mode == 'opencv_default':
+                    self.log.info('undistort:warning', frame_idx=frame_idx, message='opencv_default output is known to warp edges; treat as invalid until calibrated variants succeed.')
                 self.log.info("undistort:frame", frame_idx=frame_idx,
+                              left_mode=info_l.get("mode"),
                               left_valid_ratio=info_l.get("valid_ratio"), left_fallback=info_l.get("fallback"),
                               left_fold_ratio_x=info_l.get("fold_ratio_x"), left_fold_ratio_y=info_l.get("fold_ratio_y"),
-                              right_valid_ratio=(info_r.get("valid_ratio") if info_r else None),
-                              right_fallback=(info_r.get("fallback") if info_r else None),
-                              right_fold_ratio_x=(info_r.get("fold_ratio_x") if info_r else None),
-                              right_fold_ratio_y=(info_r.get("fold_ratio_y") if info_r else None))
+                              right_mode=(info_r.get("mode") if result_right else None),
+                              right_valid_ratio=(info_r.get("valid_ratio") if result_right else None),
+                              right_fallback=(info_r.get("fallback") if result_right else None),
+                              right_fold_ratio_x=(info_r.get("fold_ratio_x") if result_right else None),
+                              right_fold_ratio_y=(info_r.get("fold_ratio_y") if result_right else None))
+
+                if save_this and self._extra_variants:
+                    self._generate_extra_undist_outputs(frame_idx, left, right, fish_params)
 
             if save_this:
                 self._save_img(os.path.join(self.stage_dirs["20_undist_left"], f"frame_{frame_idx:06d}.jpg"), und_left)
@@ -414,4 +565,13 @@ class VRPipeline:
         elapsed = time.time() - start
         self.log.info("pipeline:done", frames_processed=frames_processed, seconds=elapsed)
         return {"frames_processed": frames_processed, "seconds": elapsed, "layout": layout, "fps": fps, "width": width, "height": height}
+
+
+
+
+
+
+
+
+
 

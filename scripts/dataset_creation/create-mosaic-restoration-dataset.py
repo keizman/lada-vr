@@ -1,6 +1,7 @@
 import argparse
 import concurrent.futures as concurrent_futures
 import queue
+import threading
 from pathlib import Path
 from time import sleep
 
@@ -17,6 +18,8 @@ from lada.lib.watermark_detector import WatermarkDetector
 def parse_args():
     parser = argparse.ArgumentParser("Create mosaic restoration dataset")
     parser.add_argument('--workers', type=int, default=2, help="Set number of multiprocessing workers")
+    parser.add_argument('--parallel-file-count', type=int, default=1,
+                        help="Number of video files to process concurrently. Each pipeline loads its own models")
 
     input = parser.add_argument_group('Input')
     input.add_argument('--input', type=Path, help="path to a video file or a directory containing NSFW videos")
@@ -87,6 +90,91 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+
+def process_video_subset(args, video_entries, pipeline_idx, input_path, output_dir, state_file_lock):
+    prefix = f"[P{pipeline_idx}]"
+    if not video_entries:
+        print(f"{prefix} No files assigned; skipping")
+        return
+
+    scenes_executor = concurrent_futures.ThreadPoolExecutor(max_workers=max(1, args.workers))
+
+    try:
+        nsfw_detection_model = YOLO(args.model)
+
+        video_quality_evaluator = VideoQualityEvaluator(device=args.video_quality_model_device) if args.add_video_quality_metadata or args.enable_video_quality_filter else None
+        watermark_detector = WatermarkDetector(YOLO(args.watermark_model_path), device=args.model_device) if args.add_watermark_metadata or args.enable_watermark_filter else None
+        nudenet_nsfw_detector = NudeNetNsfwDetector(YOLO(args.nudenet_nsfw_model_path), device=args.model_device) if args.add_nudenet_nsfw_metadata or args.enable_nudenet_nsfw_filter else None
+        censor_detector = MosaicClassifier(YOLO(args.censor_model_path), device=args.model_device) if args.add_censor_metadata or args.enable_censor_filter else None
+
+        if video_quality_evaluator:
+            print(f"{prefix} Video quality evaluator using device: {video_quality_evaluator.device}")
+        if watermark_detector:
+            print(f"{prefix} Watermark detector using device: {watermark_detector.device}")
+        if nudenet_nsfw_detector:
+            print(f"{prefix} NudeNet detector using device: {nudenet_nsfw_detector.device}")
+        if censor_detector:
+            print(f"{prefix} Censor detector using device: {censor_detector.device}")
+
+        file_queue = queue.Queue()
+        file_processing_options = FileProcessingOptions(input_dir=input_path,
+                                                        output_dir=output_dir,
+                                                        start_index=args.start_index,
+                                                        stride_length=args.stride_length,
+                                                        scene_max_length=args.scene_max_length,
+                                                        scene_max_memory=args.scene_max_memory,
+                                                        scene_min_length=args.scene_min_length,
+                                                        random_extend_masks=True,
+                                                        skip4k=args.skip_4k)
+
+        scene_processing_options = SceneProcessingOptions(output_dir=output_dir,
+                                                      save_flat=args.flat,
+                                                      out_size=args.out_size,
+                                                      save_cropped=args.save_cropped,
+                                                      save_uncropped=args.save_uncropped,
+                                                      resize_crops=args.resize_crops,
+                                                      preserve_crops=args.preserve_crops,
+                                                      save_mosaic=args.save_mosaic,
+                                                      degrade_mosaic=args.degrade_mosaic,
+                                                      save_as_images=args.save_as_images,
+                                                      quality_evaluation=SceneProcessingOptions.VideoQualityProcessingOptions(args.enable_video_quality_filter, args.add_video_quality_metadata, args.min_video_quality),
+                                                      watermark_detection=SceneProcessingOptions.WatermarkDetectionProcessingOptions(args.enable_watermark_filter, args.add_watermark_metadata),
+                                                      nudenet_nsfw_detection=SceneProcessingOptions.NudeNetNsfwDetectionProcessingOptions(args.enable_nudenet_nsfw_filter, args.add_nudenet_nsfw_metadata),
+                                                      censor_detection=SceneProcessingOptions.CensorDetectionProcessingOptions(args.enable_censor_filter, args.add_censor_metadata))
+
+        nsfw_detector = NsfwDetector(nsfw_detection_model=nsfw_detection_model, device=args.model_device,
+                                     file_queue=file_queue,
+                                     frame_queue=queue.Queue(50),
+                                     scene_queue=queue.Queue(2),
+                                     file_processing_options=file_processing_options,
+                                     state_file_lock=state_file_lock)
+        print(f"{prefix} NSFW detector using device: {nsfw_detector.device}")
+
+        scene_processor = SceneProcessor(video_quality_evaluator, watermark_detector, nudenet_nsfw_detector, censor_detector)
+
+        try:
+            nsfw_detector.start()
+            nsfw_detector.add_files(video_entries)
+            scene_futures = []
+            for scene in nsfw_detector():
+                video_name = Path(scene.video_meta_data.video_file).name
+                scene_len = scene.frame_end - scene.frame_start + 1 if scene.frame_start is not None and scene.frame_end is not None else len(scene)
+                print(
+                    f"{prefix} Found scene {scene.id} from {video_name} "
+                    f"(frames {scene.frame_start:06d}-{scene.frame_end:06d}, lengths {scene_len}/{len(scene)}), "
+                    "queuing up for processing"
+                )
+                scene_futures.append(scenes_executor.submit(scene_processor.process_scene, scene, output_dir, scene_processing_options))
+                while len([future for future in scene_futures if not future.done()]) >= args.workers + 1:
+                    sleep(1)
+                clean_up_completed_futures(scene_futures)
+            clean_up_completed_futures(scene_futures)
+            wait_until_completed(scene_futures)
+        finally:
+            nsfw_detector.stop()
+    finally:
+        scenes_executor.shutdown(wait=True)
+
 def main():
     args = parse_args()
 
@@ -94,75 +182,47 @@ def main():
         print("No save option given. Specify at least one!")
         return
 
-    scenes_executor = concurrent_futures.ThreadPoolExecutor(max_workers=args.workers)
-
-    nsfw_detection_model = YOLO(args.model)
-
-    video_quality_evaluator = VideoQualityEvaluator(device=args.video_quality_model_device) if args.add_video_quality_metadata or args.enable_video_quality_filter else None
-    watermark_detector = WatermarkDetector(YOLO(args.watermark_model_path), device=args.model_device) if args.add_watermark_metadata or args.enable_watermark_filter else None
-    nudenet_nsfw_detector = NudeNetNsfwDetector(YOLO(args.nudenet_nsfw_model_path), device=args.model_device) if args.add_nudenet_nsfw_metadata or args.enable_nudenet_nsfw_filter else None
-    censor_detector = MosaicClassifier(YOLO(args.censor_model_path), device=args.model_device) if args.add_censor_metadata or args.enable_censor_filter else None
+    input_path = args.input
+    if not input_path.exists():
+        print(f"Input path does not exist: {input_path}")
+        return
 
     output_dir = args.output_root
-    if not output_dir.exists():
-        output_dir.mkdir()
-    input_path = args.input
-    video_files = input_path.glob("*") if input_path.is_dir() else [input_path]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    video_files = list(input_path.glob("*")) if input_path.is_dir() else [input_path]
     video_files = [file for file in video_files if file.exists()]
 
-    file_queue = queue.Queue()
-    file_processing_options = FileProcessingOptions(input_dir=input_path,
-                                                    output_dir=output_dir,
-                                                    start_index=args.start_index,
-                                                    stride_length=args.stride_length,
-                                                    scene_max_length=args.scene_max_length,
-                                                    scene_max_memory=args.scene_max_memory,
-                                                    scene_min_length=args.scene_min_length,
-                                                    random_extend_masks=True,
-                                                    skip4k=args.skip_4k)
+    indexed_video_files = [(idx, file) for idx, file in enumerate(video_files)]
+    if not indexed_video_files:
+        print("No input video files found. Nothing to do.")
+        return
 
-    scene_processing_options = SceneProcessingOptions(output_dir=output_dir,
-                                                  save_flat=args.flat,
-                                                  out_size=args.out_size,
-                                                  save_cropped=args.save_cropped,
-                                                  save_uncropped=args.save_uncropped,
-                                                  resize_crops=args.resize_crops,
-                                                  preserve_crops=args.preserve_crops,
-                                                  save_mosaic=args.save_mosaic,
-                                                  degrade_mosaic=args.degrade_mosaic,
-                                                  save_as_images=args.save_as_images,
-                                                  quality_evaluation=SceneProcessingOptions.VideoQualityProcessingOptions(args.enable_video_quality_filter, args.add_video_quality_metadata, args.min_video_quality),
-                                                  watermark_detection=SceneProcessingOptions.WatermarkDetectionProcessingOptions(args.enable_watermark_filter, args.add_watermark_metadata),
-                                                  nudenet_nsfw_detection=SceneProcessingOptions.NudeNetNsfwDetectionProcessingOptions(args.enable_nudenet_nsfw_filter, args.add_nudenet_nsfw_metadata),
-                                                  censor_detection = SceneProcessingOptions.CensorDetectionProcessingOptions(args.enable_censor_filter, args.add_censor_metadata))
+    parallel_count = max(1, args.parallel_file_count)
+    parallel_count = min(parallel_count, len(indexed_video_files))
 
-    nsfw_detector = NsfwDetector(nsfw_detection_model=nsfw_detection_model, device=args.model_device,
-                                 file_queue=file_queue,
-                                 frame_queue=queue.Queue(50),
-                                 scene_queue=queue.Queue(2),
-                                 file_processing_options=file_processing_options)
-    scene_processor = SceneProcessor(video_quality_evaluator, watermark_detector, nudenet_nsfw_detector, censor_detector)
+    chunks = []
+    for i in range(parallel_count):
+        chunk = [indexed_video_files[j] for j in range(i, len(indexed_video_files), parallel_count)]
+        if chunk:
+            chunks.append(chunk)
 
-    try:
-        nsfw_detector.start()
-        nsfw_detector.add_files(video_files)
-        scene_futures = []
-        for scene in nsfw_detector():
-            print(f"Found scene {scene.id} (frames {scene.frame_start:06d}-{scene.frame_end:06d}, lengths {scene.frame_end-scene.frame_start+1}/{len(scene)}), queuing up for processing")
-            scene_futures.append(scenes_executor.submit(scene_processor.process_scene, scene, output_dir, scene_processing_options))
-            while len([future for future in scene_futures if not future.done()]) >= args.workers + 1:
-                # print(f"workers busy, block until they are available: running {len([future for future in scene_futures if future.running()])}, lets get to work: {len([future for future in scene_futures if not future.done()])}")
-                sleep(1)
-                pass  # do nothing until workers become available. Otherwise, we could queue up a lot of futures which use a lot of memory as we pass Scene objects
-            # we don't care about done futures, lets clean them up to potentially free memory
-            clean_up_completed_futures(scene_futures)
-            # print(f"deleted done future. futures now {len(scene_futures)}")
-        clean_up_completed_futures(scene_futures)
-        wait_until_completed(scene_futures)
-    finally:
-        nsfw_detector.stop()
+    print(f"Starting dataset creation with {len(chunks)} parallel pipeline(s)")
+    for pipeline_idx, chunk in enumerate(chunks):
+        print(f"[P{pipeline_idx}] Assigned {len(chunk)} file(s)")
 
-    scenes_executor.shutdown(wait=True)
+    state_file_lock = threading.Lock() if len(chunks) > 1 else None
+
+    if len(chunks) == 1:
+        process_video_subset(args, chunks[0], 0, input_path, output_dir, state_file_lock)
+    else:
+        with concurrent_futures.ThreadPoolExecutor(max_workers=len(chunks)) as pipeline_executor:
+            futures = [
+                pipeline_executor.submit(process_video_subset, args, chunk, idx, input_path, output_dir, state_file_lock)
+                for idx, chunk in enumerate(chunks)
+            ]
+            for future in futures:
+                future.result()
 
 
 if __name__ == '__main__':

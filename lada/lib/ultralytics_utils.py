@@ -12,6 +12,60 @@ from lada.lib import Box, Mask, mask_utils
 def set_default_settings():
     settings.update({'runs_dir': './experiments/yolo', 'datasets_dir': './datasets', 'tensorboard': True})
 
+
+def resolve_torch_device(device, *, allow_cpu: bool = True, description: str = "device") -> tuple[str, torch.device]:
+    """Normalize a device argument into a torch.device and string representation.
+
+    Args:
+        device: The requested device expressed as a string (e.g. 'cuda:0', 'cpu'), torch.device or None.
+        allow_cpu: When False, raise if the resolved device ends up on CPU.
+        description: Human readable name for the device used in error messages.
+
+    Returns:
+        A tuple containing the canonical device string (e.g. 'cuda:0') and the corresponding torch.device instance.
+
+    Raises:
+        RuntimeError: If the device string is invalid or not available on the current machine.
+    """
+    desc = description or "device"
+
+    if isinstance(device, torch.device):
+        torch_device = device
+    else:
+        device_arg = str(device).strip() if device is not None else ""
+        if device_arg == "" or device_arg.lower() == "auto":
+            device_arg = "cuda:0" if torch.cuda.is_available() else "cpu"
+        try:
+            torch_device = torch.device(device_arg)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid {desc} '{device}'.") from exc
+
+    if torch_device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA is not available but {desc} '{torch_device}' was requested.")
+        index = torch_device.index if torch_device.index is not None else 0
+        if index < 0 or index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"{desc.capitalize()} GPU index {index} is out of range (available: {torch.cuda.device_count()})."
+            )
+        torch_device = torch.device(f"cuda:{index}")
+    elif torch_device.type == "cpu":
+        if not allow_cpu:
+            raise RuntimeError(f"{desc.capitalize()} requires a CUDA-capable device but '{torch_device}' was provided.")
+    elif torch_device.type == "mps":
+        mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        if not mps_available:
+            raise RuntimeError(f"Apple MPS is not available but {desc} '{torch_device}' was requested.")
+    else:
+        raise RuntimeError(f"Unsupported {desc} type '{torch_device.type}'.")
+
+    device_str = (
+        torch_device.type
+        if torch_device.index is None
+        else f"{torch_device.type}:{torch_device.index}"
+    )
+    return device_str, torch_device
+
 def convert_yolo_box(yolo_box: ultralytics.engine.results.Boxes, img_shape) -> Box:
     _box = yolo_box.xyxy[0]
     l = int(torch.clip(_box[0], 0, img_shape[1]).item())

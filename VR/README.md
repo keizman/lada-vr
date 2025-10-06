@@ -61,6 +61,15 @@ Configuration
 - save_every_n: Save stage images every N frames (reduce disk IO; set to 1 for every frame)
 - max_frames: Limit frames processed (useful for pilots)
 
+Undistortion strategies
+- Select a strategy with `--undist-mode`. Available options: `opencv_default`, `opencv_calibrated`, `opencv_charuco`, `opencv_chessboard`, `woodscape_cylindrical`, `auto_lines`.
+- `opencv_default` uses the built-in heuristic fisheye parameters (previous behaviour) and is **not reliable**—edges remain warped without proper calibration; treat outputs as invalid unless no other option exists.
+- `opencv_charuco` and `opencv_chessboard` load `K`/`D` from external calibration JSON/YAML (from the referenced repositories). Provide the file with `--undist-calibration`; optional `--undist-balance` and `--undist-reference` tweak scaling.
+- `woodscape_cylindrical` implements the tutorial mapping; pass the WoodScape-style calibration via `--undist-calibration` and optionally tune `--undist-hfov` / `--undist-vfov`.
+- `auto_lines` samples frames, detects straight segments, and auto-fits a fisheye polynomial when no calibration exists (experimental; success depends on scene with strong straight edges).
+- The helper script `python VR/cli/export_undist_variants.py` can produce side-by-side outputs for manual inspection; repeat `--woodscape-variant hfov=185,vfov=135,label=soft` (or multiple specs) to emit several cylindrical variants at once.
+- When those calibration files exist under `tmp/` or `configs/`, the pipeline run automatically saves extra Stage 20 snapshots under `20_undist_charuco`, `20_undist_chessboard`, and `20_undist_woodscape` for quick visual comparison.
+
 Running the pipeline (examples)
 - Python dependencies: `pip install opencv-python`
 - Example (Windows PowerShell):
@@ -97,6 +106,12 @@ Next steps
 2) Add equirect 180 plane option and v360/cuda integration where available.
 3) Integrate AI restoration stage and ensure stereo consistency checks.
 4) Add VR metadata writing to the final muxed video output.
+
+
+
+
+
+
 
 
 
