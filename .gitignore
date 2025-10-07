@@ -11,3 +11,4 @@ tmp/Fisheye_ChArUco_Calibration
 tmp/opencv-fisheye-undistortion
 tmp/VR-reversal
 /tmp/*
+model_weights/3rd_party/new/last_checkpoint
