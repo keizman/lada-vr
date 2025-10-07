@@ -99,7 +99,6 @@ val_cfg = dict(type='MultiValLoop')
 
 # optimizer
 optim_wrapper = dict(
-    type='OptimWrapperDict',  # ✅ 必须指定类型为 OptimWrapperDict
     constructor='MultiOptimWrapperConstructor',
     generator=dict(
         type='OptimWrapper',

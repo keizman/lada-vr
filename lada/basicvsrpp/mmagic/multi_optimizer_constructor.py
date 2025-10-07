@@ -133,9 +133,6 @@ class MultiOptimWrapperConstructor:
             self.constructors = {}
             self.modules = {}
             for key, cfg in self.optim_cfg.items():
-                # 跳过 type, constructor 等配置字段（这些是字符串，不是优化器配置）
-                if not isinstance(cfg, dict):
-                    continue
                 cfg_ = cfg.copy()
                 if 'modules' in cfg_:
                     self.modules[key] = cfg_.pop('modules')
