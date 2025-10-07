@@ -99,7 +99,7 @@ val_cfg = dict(type='MultiValLoop')
 
 # optimizer
 optim_wrapper = dict(
-    #_delete_=True, # this was set to true in RealBasicVSR but I get a exception as value is not expected to be a boolean but needs to be a dict
+    type='OptimWrapperDict',  # ✅ 必须指定类型为 OptimWrapperDict
     constructor='MultiOptimWrapperConstructor',
     generator=dict(
         type='OptimWrapper',
