@@ -170,7 +170,7 @@ class Clip:
         return self.data[item]
 
 class MosaicDetector:
-    def __init__(self, model: MosaicDetectionModel, video_file, frame_detection_queue: queue.Queue, mosaic_clip_queue: queue.Queue, max_clip_length=30, clip_size=256, device=None, pad_mode='reflect', batch_size=4):
+    def __init__(self, model: MosaicDetectionModel, video_file, frame_detection_queue: queue.Queue, mosaic_clip_queue: queue.Queue, max_clip_length=30, clip_size=256, device=None, pad_mode='reflect', batch_size=4, queue_maxsize: int = 8):
         self.model = model
         self.video_file = video_file
         self.device = torch.device(device) if device is not None else device
@@ -184,8 +184,8 @@ class MosaicDetector:
         self.video_meta_data = video_utils.get_video_meta_data(self.video_file)
         self.frame_detection_queue = frame_detection_queue
         self.mosaic_clip_queue = mosaic_clip_queue
-        self.frame_feeder_queue = queue.Queue(maxsize=8)
-        self.inference_queue = queue.Queue(maxsize=8)
+        self.frame_feeder_queue = queue.Queue(maxsize=queue_maxsize)
+        self.inference_queue = queue.Queue(maxsize=queue_maxsize)
         self.frame_detector_thread: threading.Thread | None = None
         self.frame_feeder_thread: threading.Thread | None = None
         self.inference_thread: threading.Thread | None = None
@@ -193,6 +193,7 @@ class MosaicDetector:
         self.frame_detector_thread_should_be_running = False
         self.inference_worker_thread_should_be_running = False
         self.stop_requested = False
+        # Use provided batch size (default 4). Avoid hard-coding to allow tuning.
         self.batch_size = batch_size
 
         self.queue_stats = {}

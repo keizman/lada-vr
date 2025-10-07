@@ -1,5 +1,6 @@
 import json
 import os
+import logging
 import re
 import subprocess
 from contextlib import contextmanager
@@ -11,6 +12,8 @@ import cv2
 import numpy as np
 
 from lada.lib import Image, Mask, VideoMetadata
+
+logger = logging.getLogger(__name__)
 
 
 def read_video_frames(path: str, float32: bool = True, start_idx: int = 0, end_idx: int | None = None, normalize_neg1_pos1 = False, binary_frames=False) -> list[np.ndarray]:
@@ -66,20 +69,56 @@ def VideoReaderOpenCV(*args, **kwargs):
         cap.release()
 
 class VideoReader:
-    def __init__(self, file):
+    def __init__(self, file, hwaccel: str | None = None):
+        """
+        Simple video reader based on PyAV.
+
+        hwaccel: optional hardware acceleration backend, e.g. 'cuda'.
+                 If None, will check environment variable 'LADA_HWACCEL'.
+        """
         self.file = file
         self.container = None
+        self.video_stream = None
+        self.hwaccel = hwaccel or os.getenv('LADA_HWACCEL')
 
     def __enter__(self):
-        self.container = av.open(self.file)
-        return self
+        # Try to enable HW-accelerated decoding if requested. Fallback to CPU.
+        options = {}
+        if self.hwaccel:
+            # Common FFmpeg hwaccel options. Not all builds support them – fallback on error.
+            if self.hwaccel.lower() == 'cuda':
+                options = {'hwaccel': 'cuda', 'hwaccel_output_format': 'cuda'}
+        try:
+            self.container = av.open(self.file, options=options) if options else av.open(self.file)
+            # Keep a handle to the first video stream for potential codec options
+            if self.container.streams.video:
+                self.video_stream = self.container.streams.video[0]
+                # Some builds allow setting codec context options post-open
+                if options and hasattr(self.video_stream, 'codec_context'):
+                    try:
+                        for k, v in options.items():
+                            self.video_stream.codec_context.options[k] = v
+                    except Exception:
+                        # Best-effort only; ignore if backend does not support
+                        pass
+            return self
+        except Exception as e:
+            logger.debug(f"VideoReader: HW decode open failed ({e}); falling back to CPU for {self.file}")
+            self.container = av.open(self.file)
+            return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.container.close()
 
     def frames(self):
         for frame in self.container.decode(video=0):
-            frame_img = frame.to_ndarray(format='bgr24')
+            # If frames are on GPU (when using hwaccel), request BGR24 ndarray.
+            # PyAV will hwdownload if necessary; on unsupported builds this still works.
+            try:
+                frame_img = frame.to_ndarray(format='bgr24')
+            except Exception as e:
+                logger.debug(f"VideoReader: to_ndarray failed with {e}; retrying without format")
+                frame_img = frame.to_ndarray()
             yield frame_img, frame.pts
 
     def seek(self, offset_ns):

@@ -56,6 +56,12 @@ def setup_argparser() -> argparse.ArgumentParser:
     group_restoration.add_argument('--mosaic-restoration-config-path', type=str, default=None, help=_("Path to restoration model configuration file"))
     group_restoration.add_argument('--max-clip-length', type=int, default=180, help=_('Maximum number of frames for restoration. Higher values improve temporal stability. Lower values reduce memory footprint. If set too low flickering could appear (default: %(default)s)'))
 
+    # Performance tuning
+    perf = parser.add_argument_group(_('Performance'))
+    perf.add_argument('--hw-decode', action='store_true', default=False, help=_('Use hardware-accelerated video decode if available (NVDEC/cuda)'))
+    perf.add_argument('--mosaic-detection-batch-size', type=int, default=4, help=_('Batch size for mosaic detection (higher uses more VRAM, may improve throughput)'))
+    perf.add_argument('--detector-queue-size', type=int, default=8, help=_('Internal queue size for detector pipelines'))
+
     group_detection = parser.add_argument_group('Mosaic Detection')
     group_detection.add_argument('--mosaic-detection-model-path', type=str, default=os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v3.1_fast.pt'), help=_("Path to restoration model weights file (default: %(default)s)"))
     group_detection.add_argument('--list-mosaic-detection-models', action='store_true', help=_("List available detection model weights found in MODEL_WEIGHTS_DIR and exit (default location is './model_weights' if not overwritten by environment variable MODEL_WEIGHTS_DIR)"))
@@ -138,11 +144,17 @@ def dump_available_restoration_models():
     print(s)
 
 def process_video_file(input_path: str, output_path: str, device, mosaic_restoration_model, mosaic_detection_model,
-                       mosaic_restoration_model_name, preferred_pad_mode, max_clip_length, codec, crf, moov_front, preset, custom_encoder_options, print_prefix=""):
+                       mosaic_restoration_model_name, preferred_pad_mode, max_clip_length, codec, crf, moov_front, preset, custom_encoder_options, print_prefix="",
+                       hw_decode=False, detector_batch_size=4, detector_queue_size=8):
     video_metadata = get_video_meta_data(input_path)
 
+    # Enable HW decode via env var for the low-level reader
+    if hw_decode:
+        os.environ['LADA_HWACCEL'] = os.environ.get('LADA_HWACCEL', 'cuda')
     frame_restorer = FrameRestorer(device, input_path, max_clip_length, mosaic_restoration_model_name,
-                 mosaic_detection_model, mosaic_restoration_model, preferred_pad_mode)
+                 mosaic_detection_model, mosaic_restoration_model, preferred_pad_mode,
+                 mosaic_detection_batch_size=detector_batch_size,
+                 detector_queue_maxsize=detector_queue_size)
     success = True
     video_tmp_file_output_path = os.path.join(tempfile.gettempdir(), f"{os.path.basename(os.path.splitext(output_path)[0])}.tmp{os.path.splitext(output_path)[1]}")
     pathlib.Path(output_path).parent.mkdir(exist_ok=True, parents=True)
@@ -266,7 +278,8 @@ def main():
         try:
             process_video_file(input_path=input_path, output_path=output_path, device=args.device, mosaic_restoration_model=mosaic_restoration_model, mosaic_detection_model=mosaic_detection_model,
                                mosaic_restoration_model_name=args.mosaic_restoration_model, preferred_pad_mode=preferred_pad_mode, max_clip_length=args.max_clip_length,
-                               codec=args.codec, crf=args.crf, moov_front=args.moov_front, preset=args.preset, custom_encoder_options=args.custom_encoder_options)
+                               codec=args.codec, crf=args.crf, moov_front=args.moov_front, preset=args.preset, custom_encoder_options=args.custom_encoder_options,
+                               hw_decode=args.hw_decode, detector_batch_size=args.mosaic_detection_batch_size, detector_queue_size=args.detector_queue_size)
         except KeyboardInterrupt:
             print(_("Received Ctrl-C, stopping restoration."))
             break

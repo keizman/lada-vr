@@ -22,7 +22,7 @@ model = dict(
         std=[255., 255., 255.],
     ))
 
-data_root = 'datasets/mosaic_removal_vid'
+data_root = '/mnt/k/tmp/v/t/train_with_mosaic'
 
 train_dataloader = dict(
     num_workers=4,
@@ -31,7 +31,7 @@ train_dataloader = dict(
     sampler=dict(type='InfiniteSampler', shuffle=True),
     dataset=dict(
         type='MosaicVideoDataset',
-        metadata_root_dir=data_root + "/train/crop_unscaled_meta",
+        metadata_root_dir=data_root + "/crop_unscaled_meta",
         num_frame=30,
         degrade=True,
         use_hflip=True,
