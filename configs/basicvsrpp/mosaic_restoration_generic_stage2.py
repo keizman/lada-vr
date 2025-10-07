@@ -134,3 +134,10 @@ default_hooks = dict(
     logger=dict(type='LoggerHook', interval=100, log_metric_by_epoch=False),
     param_scheduler=dict(type='ParamSchedulerHook'),
 )
+
+# GAN 模型的 model wrapper 配置
+# 注意：GAN 模型有自定义的 train_step，不能使用 MMDistributedDataParallel
+# 因为它会干预 train_step 并尝试调用 optim_wrapper.optim_context()
+# 这与 GAN 的多优化器 train_step 冲突
+# 解决方案：禁用 model wrapper，使用模型自己的 train_step
+model_wrapper_cfg = None

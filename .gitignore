@@ -10,3 +10,4 @@ __pycache__
 tmp/Fisheye_ChArUco_Calibration
 tmp/opencv-fisheye-undistortion
 tmp/VR-reversal
+/tmp/*
