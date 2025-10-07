@@ -1,6 +1,11 @@
 import argparse
 import os
 import os.path as osp
+
+# 🔧 必须在导入MMEngine之前设置，否则无效
+# 跳过dataloader状态恢复，避免resume时卡在"Advance dataloader N steps"
+os.environ['MMENGINE_RESUME_DATALOADER'] = '0'
+
 from mmengine.config import Config, DictAction
 from mmengine.runner import Runner
 from lada.basicvsrpp import register_all_modules
@@ -67,10 +72,27 @@ def main():
         cfg.work_dir = osp.join('./work_dirs',
                                 osp.splitext(osp.basename(args.config))[0])
 
+    # 自动检测是否需要resume
+    last_checkpoint_file = osp.join(cfg.work_dir, 'last_checkpoint')
     if args.resume:
         cfg.resume = True
+        print("✅ Resume mode enabled (--resume flag)")
+    elif osp.exists(last_checkpoint_file):
+        # 自动resume：如果存在last_checkpoint文件且没有明确指定--load-from
+        if not args.load_from:
+            cfg.resume = True
+            print(f"✅ Auto-resume enabled: Found checkpoint at {last_checkpoint_file}")
+            with open(last_checkpoint_file, 'r') as f:
+                last_ckpt_path = f.read().strip()
+                print(f"   Resuming from: {last_ckpt_path}")
+            print("   ⚡ Fast resume mode: Dataloader will restart (not skip already-seen data)")
+            print("      This avoids the slow 'Advance dataloader' step")
+        else:
+            print(f"⚠️  Found existing checkpoint but --load-from specified, starting fresh")
+    
     if args.load_from:
         cfg.load_from = args.load_from
+        print(f"📂 Loading weights from: {args.load_from}")
 
     # build the runner from config
     runner = Runner.from_cfg(cfg)

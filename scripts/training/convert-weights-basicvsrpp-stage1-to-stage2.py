@@ -7,8 +7,9 @@ from lada.basicvsrpp import register_all_modules
 
 register_all_modules()
 
-BASICVSRPP_WEIGHTS_PATH = 'experiments/basicvsrpp/mosaic_restoration_generic_stage1/iter_10000.pth'
-BASICVSRPP_GAN_WEIGHTS_PATH = 'experiments/basicvsrpp/mosaic_restoration_generic_stage1/iter_10000_converted.pth'
+
+BASICVSRPP_WEIGHTS_PATH = 'experiments/basicvsrpp/mosaic_restoration_frozen_finetune/iter_3000.pth'
+BASICVSRPP_GAN_WEIGHTS_PATH = 'experiments/basicvsrpp/mosaic_restoration_frozen_finetune/iter_converted.pth'
 
 gan_model = BasicVSRPlusPlusGan(
     generator=dict(

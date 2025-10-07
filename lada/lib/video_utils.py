@@ -5,6 +5,7 @@ import subprocess
 from contextlib import contextmanager
 from fractions import Fraction
 from typing import Callable
+import unicodedata
 
 import av
 import cv2
@@ -14,6 +15,8 @@ from lada.lib import Image, Mask, VideoMetadata
 
 
 def read_video_frames(path: str, float32: bool = True, start_idx: int = 0, end_idx: int | None = None, normalize_neg1_pos1 = False, binary_frames=False) -> list[np.ndarray]:
+    # Resolve cross-OS filename compatibility (Windows-escaped names, Unicode normalizations)
+    path = resolve_path_compat(path)
     with VideoReaderOpenCV(path) as video_reader:
         frames = []
         i = 0
@@ -35,6 +38,7 @@ def read_video_frames(path: str, float32: bool = True, start_idx: int = 0, end_i
                 break
     return frames
 
+
 def resize_video_frames(frames: list, size: int | tuple[int, int]):
     resized = []
     target_size = size if isinstance(size, (list, tuple)) else (size, size)
@@ -44,6 +48,7 @@ def resize_video_frames(frames: list, size: int | tuple[int, int]):
         else:
             resized.append(cv2.resize(frame, (size, size), interpolation=cv2.INTER_LINEAR))
     return resized
+
 
 def pad_to_compatible_size_for_video_codecs(imgs):
     # dims need to be divisible by 2 by most codecs. given the chroma / pix format dims must be divisible by 4
@@ -55,6 +60,73 @@ def pad_to_compatible_size_for_video_codecs(imgs):
     else:
         return [np.pad(img, ((0, pad_h), (0, pad_w), (0,0))).astype(np.uint8) for img in imgs]
 
+
+# --------------------
+# Cross-OS path compatibility helpers
+# --------------------
+
+def _hashu_decode(s: str) -> str:
+    """Convert '#UXXXX' (hex codepoint) sequences to the corresponding Unicode chars."""
+    return re.sub(r"#U([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
+
+
+def _hashu_encode(s: str) -> str:
+    """Encode non-ASCII chars to '#UXXXX' (lowercase hex) sequences."""
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if code < 128:
+            out.append(ch)
+        else:
+            out.append(f"#U{code:04x}")
+    return ''.join(out)
+
+
+def resolve_path_compat(path: str) -> str:
+    """Return a path that exists on this OS by trying common cross-platform variants.
+
+    Tries in order:
+    - original path
+    - decode '#UXXXX' -> Unicode
+    - encode Unicode -> '#UXXXX'
+    - Unicode NFC/NFD normalizations
+    Returns the first variant that exists; otherwise the original path.
+    """
+    try:
+        # Normalize separators (just in case of stray Windows backslashes)
+        path = path.replace('\\', os.sep)
+        if os.path.exists(path):
+            return path
+
+        d = os.path.dirname(path)
+        b = os.path.basename(path)
+        candidates = []
+
+        # '#Uxxxx' -> Unicode
+        if '#U' in b:
+            candidates.append(os.path.join(d, _hashu_decode(b)))
+
+        # Unicode -> '#Uxxxx'
+        if any(ord(c) > 127 for c in b):
+            candidates.append(os.path.join(d, _hashu_encode(b)))
+
+        # Unicode normalization variants
+        try:
+            candidates.append(os.path.join(d, unicodedata.normalize('NFC', b)))
+            candidates.append(os.path.join(d, unicodedata.normalize('NFD', b)))
+        except Exception:
+            pass
+
+        for cand in candidates:
+            cand = cand.replace('\\', os.sep)
+            if os.path.exists(cand):
+                return cand
+    except Exception:
+        # If anything goes wrong, fall back to the original path
+        pass
+    return path
+
+
 @contextmanager
 def VideoReaderOpenCV(*args, **kwargs):
     cap = cv2.VideoCapture(*args, **kwargs)
@@ -64,6 +136,7 @@ def VideoReaderOpenCV(*args, **kwargs):
         yield cap
     finally:
         cap.release()
+
 
 class VideoReader:
     def __init__(self, file):
@@ -86,7 +159,10 @@ class VideoReader:
         offset = int((offset_ns / 1_000_000_000) * av.time_base)
         self.container.seek(offset)
 
+
 def get_video_meta_data(path: str) -> VideoMetadata:
+    # Resolve cross-OS path variants before probing
+    path = resolve_path_compat(path)
     cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-select_streams', 'v', '-show_streams', '-show_format', path]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err =  p.communicate()
@@ -132,8 +208,10 @@ def get_video_meta_data(path: str) -> VideoMetadata:
     )
     return metadata
 
+
 def offset_ns_to_frame_num(offset_ns, video_fps_exact):
     return int(Fraction(offset_ns, 1_000_000_000) * video_fps_exact)
+
 
 def write_frames_to_video_file(frames: list[Image], output_path, fps: int | float | Fraction, codec='x264', preset='medium', crf=None):
     assert frames[0].ndim == 3
@@ -158,166 +236,3 @@ def write_frames_to_video_file(frames: list[Image], output_path, fps: int | floa
     ffmpeg_process.wait()
     if ffmpeg_process.returncode != 0:
         print(f"ERROR when writing video via ffmpeg to file: {output_path}, return code: {ffmpeg_process.returncode}")
-        print(f"stderr: {ffmpeg_process.stderr.read()}")
-
-def write_masks_to_video_file(frames: list[Mask], output_path, fps: int | float | Fraction):
-    #assert frames[0].ndim == 2
-    width = frames[0].shape[1]
-    height = frames[0].shape[0]
-    ffmpeg_output = [
-        'nice', '-n', '19', 'ffmpeg', '-y',
-        '-f', 'rawvideo', '-pix_fmt', 'gray', '-s', f'{width}x{height}', '-r', f"{fps.numerator}/{fps.denominator}" if type(fps) == Fraction else str(fps),
-        '-i', '-', '-an', '-vcodec', 'ffv1', '-level', '3', '-tag:v', 'ffv1',  output_path
-    ]
-
-    ffmpeg_process = subprocess.Popen(ffmpeg_output, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    for frame in frames:
-        try:
-            ffmpeg_process.stdin.write(frame.tobytes())
-        except Exception as e:
-            print(f"ERROR when writing video via ffmpeg to file: {output_path}")
-            print(f"exception: {e}")
-            print(f"stderr: {ffmpeg_process.stderr.read()}")
-            print(f"stdout: {ffmpeg_process.stdout.read()}")
-            raise e
-    ffmpeg_process.stdin.close()
-    ffmpeg_process.wait()
-    if ffmpeg_process.returncode != 0:
-        print(f"ERROR when writing video via ffmpeg to file: {output_path}, return code: {ffmpeg_process.returncode}")
-        print(f"stderr: {ffmpeg_process.stderr.read()}")
-        print(f"stdout: {ffmpeg_process.stdout.read()}")
-
-def process_video_v3(input_path, output_path, frame_processor: Callable[[Image], Image]):
-    video_metadata = get_video_meta_data(input_path)
-    video_reader = cv2.VideoCapture(input_path)
-    video_writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps=video_metadata.video_fps, frameSize=(video_metadata.video_width, video_metadata.video_height))
-    while video_reader.isOpened():
-        ret, frame = video_reader.read()
-        if ret:
-            processed_frame = frame_processor(frame)
-            video_writer.write(processed_frame)
-        else:
-            break
-    video_reader.release()
-    video_writer.release()
-
-def approx_memory(video_metadata: VideoMetadata, frames_count, assume_images=True, assume_masks=True):
-    size = 0
-    frame_size_image = video_metadata.video_width * video_metadata.video_height * 3 * 1
-    frame_size_mask = video_metadata.video_width * video_metadata.video_height * 1 * 1
-    if assume_images:
-        size += frame_size_image * frames_count
-    if assume_masks:
-        size += frame_size_mask * frames_count
-    return size
-
-def approx_max_length_by_memory_limit(video_metadata: VideoMetadata, limit_in_megabytes, assume_images=True, assume_masks=True):
-    frame_size_image = approx_memory(video_metadata, 1, assume_images=assume_images, assume_masks=assume_masks)
-    max_length_frames = (limit_in_megabytes * 1024 * 1024) / frame_size_image
-    max_length_seconds = int(max_length_frames / video_metadata.video_fps)
-    return max_length_seconds
-
-class VideoWriter:
-    def parse_custom_options(self, custom_encoder_options):
-        # squeeze spaces
-        custom_encoder_options = ' '.join(custom_encoder_options.split())
-        regex = re.compile(r"-(\w+ \w+)")
-        matches = regex.findall(custom_encoder_options)
-        encoder_options = {}
-        for match in matches:
-            option, value = match.split()
-            encoder_options[option] = value
-        return encoder_options
-
-    def get_default_encoder_options(self):
-        libx264 = {
-            'preset': 'medium',
-            'crf': '20'
-        }
-        libx265 = {
-            'preset': 'medium',
-            'crf': '23',
-            'x265-params': 'log_level=error'
-        }
-        encoder_defaults = {}
-        encoder_defaults['libx264'] = libx264
-        encoder_defaults['h264'] = libx264
-        encoder_defaults['libx265'] = libx265
-        encoder_defaults['hevc'] = libx265
-        return encoder_defaults
-
-    def __init__(self, output_path, width, height, fps, codec, crf=None, preset=None, time_base=None, moov_front=False, custom_encoder_options=None):
-        container_options = {"movflags": "+frag_keyframe+empty_moov+faststart"} if moov_front else {}
-        encoder_defaults = self.get_default_encoder_options()
-        encoder_options = encoder_defaults.get(codec, {})
-
-        if crf is not None:
-            if codec in ('hevc_nvenc', 'h264_nvenc'):
-                encoder_options['rc'] = 'constqp'
-                encoder_options['qp'] = str(crf)
-            else:
-                encoder_options['crf'] = str(crf)
-        if preset:
-            encoder_options['preset'] = preset
-
-        if custom_encoder_options:
-            encoder_options.update(self.parse_custom_options(custom_encoder_options))
-
-        output_container = av.open(output_path, "w", options=container_options)
-        video_stream_out: av.VideoStream = output_container.add_stream(codec, fps)
-
-        video_stream_out.width = width
-        video_stream_out.height = height
-        video_stream_out.thread_count = 0
-        video_stream_out.thread_type = 3
-        video_stream_out.time_base = time_base
-
-        # up until PyAV 15.5.0 it was enough to set these settings on the stream only.
-        video_stream_out.codec_context.width = width
-        video_stream_out.codec_context.height = height
-        video_stream_out.codec_context.thread_count = 0
-        video_stream_out.codec_context.thread_type = 3
-        video_stream_out.codec_context.time_base = time_base
-
-        video_stream_out.options = encoder_options
-        self.output_container = output_container
-        self.video_stream = video_stream_out
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.release()
-
-    def write(self, frame, frame_pts=None, bgr2rgb=False):
-        if bgr2rgb:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        out_frame = av.VideoFrame.from_ndarray(frame, format='rgb24')
-        if frame_pts:
-            out_frame.pts = frame_pts
-        out_packet = self.video_stream.encode(out_frame)
-        self.output_container.mux(out_packet)
-
-    def release(self):
-        out_packet = self.video_stream.encode(None)
-        self.output_container.mux(out_packet)
-        self.output_container.close()
-
-def is_video_file(file_path):
-    SUPPORTED_VIDEO_FILE_EXTENSIONS = {".asf", ".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".ts", ".wmv",
-                                       ".webm"}
-
-    file_ext = os.path.splitext(file_path)[1]
-    return file_ext.lower() in SUPPORTED_VIDEO_FILE_EXTENSIONS
-
-def get_available_video_encoder_codecs():
-    codecs = set()
-    for name in av.codec.codecs_available:
-        try:
-            e_codec = av.codec.Codec(name, "w")
-        except ValueError:
-            continue
-        if e_codec.type != 'video':
-            continue
-        codecs.add((e_codec.name, e_codec.long_name))
-    return sorted(list(codecs))
